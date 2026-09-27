@@ -2,6 +2,17 @@ services:
   - type: web
     name: bestoption-api
     runtime: python
-    buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn main:app
+    plan: free
+    buildCommand: pip install --upgrade pip && pip install -r requirements.txt
+    startCommand: bash start.sh
+    healthCheckPath: /api/health
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.12.4"
+      - key: DATABASE_URL
+        sync: false
+      - key: JWT_SECRET
+        generateValue: true
+      - key: ALLOWED_ORIGINS
+        value: "*"
     

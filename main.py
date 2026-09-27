@@ -21,6 +21,11 @@ load_dotenv()
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./bestoption.db")
 JWT_SECRET = os.getenv("JWT_SECRET", "dev-secret-key")
 JWT_ALGORITHM = "HS256"
+ALLOWED_ORIGINS = [
+    origin.strip()
+    for origin in os.getenv("ALLOWED_ORIGINS", "*").split(",")
+    if origin.strip()
+] or ["*"]
 
 connect_args = {"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {}
 engine = create_engine(DATABASE_URL, connect_args=connect_args)
@@ -76,7 +81,11 @@ class WatchlistItem(Base):
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
 
 
-Base.metadata.create_all(bind=engine)
+def init_db() -> None:
+    Base.metadata.create_all(bind=engine)
+
+
+init_db()
 
 
 class AuthRequest(BaseModel):
@@ -104,10 +113,16 @@ class WatchlistCreate(BaseModel):
     market: Optional[str] = None
 
 
-app = FastAPI(title="BestOption API", version="1.0.0")
+app = FastAPI(
+    title="BestOption API",
+    version="1.0.0",
+    description="Trading dashboard backend for BestOption",
+    docs_url="/docs",
+    redoc_url="/redoc",
+)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
