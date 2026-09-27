@@ -1,7 +1,7 @@
 services:
   - type: web
     name: bestoption-api
-    runtime: python
+    runtime: python-3.12.7
     plan: free
     buildCommand: pip install --upgrade pip && pip install -r requirements.txt
     startCommand: bash start.sh
