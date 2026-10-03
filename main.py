@@ -141,15 +141,18 @@ app = FastAPI(
     docs_url="/docs",
     redoc_url="/redoc",
 )
+
+FRONTEND_URL = os.getenv("FRONTEND_URL", "https://bestoption-frontend.vercel.app")
+ORIGINS = [
+    FRONTEND_URL,
+    f"https://www.{FRONTEND_URL.removeprefix('https://')}",
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "https://bestoption-frontend.vercel.app",
-        "https://bestoption-frontend-y8zu.vercel.app",
-        "http://localhost:3000",
-        "http://127.0.0.1:3000",
-    ],
-    allow_origin_regex=r"https://bestoption-frontend(?:-[a-z0-9-]+)?\.vercel\.app",
+    allow_origins=ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
