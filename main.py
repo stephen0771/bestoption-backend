@@ -1,12 +1,17 @@
 from __future__ import annotations
 
 import hashlib
+import html
+import logging
+import math
 import os
+import re
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 
+import httpx
 import jwt
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, HTTPException, status
@@ -18,9 +23,14 @@ from sqlalchemy.orm import Session, declarative_base, sessionmaker
 
 load_dotenv()
 
+log = logging.getLogger("app")
+
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./bestoption.db")
 JWT_SECRET = os.getenv("JWT_SECRET", "dev-secret-key")
 JWT_ALGORITHM = "HS256"
+RESEND_API_KEY = os.getenv("RESEND_API_KEY")
+EMAIL_FROM = os.getenv("EMAIL_FROM", "BestOption <onboarding@resend.dev>")
+APP_URL = os.getenv("APP_URL", "https://bestoption-frontend-y8zu.vercel.app")
 ALLOWED_ORIGINS = [
     origin.strip()
     for origin in os.getenv("ALLOWED_ORIGINS", "*").split(",")
@@ -28,7 +38,17 @@ ALLOWED_ORIGINS = [
 ] or ["*"]
 
 connect_args = {"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {}
-engine = create_engine(DATABASE_URL, connect_args=connect_args)
+if DATABASE_URL.startswith("sqlite"):
+    engine = create_engine(DATABASE_URL, connect_args=connect_args, pool_pre_ping=True)
+else:
+    engine = create_engine(
+        DATABASE_URL,
+        pool_pre_ping=True,
+        pool_size=10,
+        max_overflow=20,
+        pool_timeout=30,
+        future=True,
+    )
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
@@ -92,6 +112,7 @@ class AuthRequest(BaseModel):
     email: str
     password: str
     full_name: str = ""
+    confirm_password: Optional[str] = None
 
 
 class TradeCreate(BaseModel):
@@ -130,6 +151,12 @@ app.add_middleware(
 )
 
 security = HTTPBearer(auto_error=False)
+
+EMAIL_REGEX = re.compile(r"^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$")
+
+
+def is_valid_email(email: str) -> bool:
+    return bool(email) and bool(EMAIL_REGEX.fullmatch(email.strip()))
 
 
 def hash_password(password: str) -> str:
@@ -191,6 +218,80 @@ def serialize_watchlist(item: WatchlistItem) -> Dict[str, Any]:
     }
 
 
+def validate_trade_payload(payload: TradeCreate) -> Dict[str, Any]:
+    symbol = payload.symbol.strip().upper()
+    side = payload.side.strip().lower()
+
+    if not symbol:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Symbol is required")
+    if side not in {"buy", "sell"}:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Trade side must be buy or sell")
+    if not math.isfinite(payload.price) or payload.price <= 0:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Trade price must be greater than zero")
+    if payload.quantity <= 0:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Trade quantity must be greater than zero")
+
+    estimated_cost = round(float(payload.quantity * payload.price), 2)
+    return {
+        "symbol": symbol,
+        "side": side,
+        "quantity": payload.quantity,
+        "price": float(payload.price),
+        "estimated_cost": estimated_cost,
+        "verified": True,
+        "message": "Trade verification passed",
+    }
+
+
+def validate_transaction_payload(payload: TransactionCreate, balance: float) -> Dict[str, Any]:
+    if not math.isfinite(payload.amount) or payload.amount <= 0:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Transaction amount must be greater than zero")
+    if payload.type not in {"deposit", "withdraw"}:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Transaction type must be deposit or withdraw")
+    if payload.type == "withdraw" and balance < payload.amount:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Insufficient balance for withdrawal")
+
+    return {
+        "type": payload.type,
+        "amount": float(payload.amount),
+        "verified": True,
+        "message": "Financial verification passed",
+        "available_balance": round(float(balance), 2),
+    }
+
+
+async def send_welcome_email(to: str, name: str) -> None:
+    if not RESEND_API_KEY:
+        log.warning("email.skipped_no_api_key")
+        return
+
+    safe_name = html.escape(name.split()[0] if name else "there")
+    body = f"""
+      <p>Hi {safe_name},</p>
+      <p>Welcome to BestOption. Your demo account is ready with $10,000 of virtual funds,
+         so you can practise trading with no risk.</p>
+      <p><a href=\"{APP_URL}\">Open your dashboard</a></p>
+      <p>Trading involves risk. Demo results do not guarantee live results.</p>
+    """
+
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            response = await client.post(
+                "https://api.resend.com/emails",
+                headers={"Authorization": f"Bearer {RESEND_API_KEY}"},
+                json={
+                    "from": EMAIL_FROM,
+                    "to": [to],
+                    "subject": "Welcome to BestOption",
+                    "html": body,
+                },
+            )
+            response.raise_for_status()
+        log.info("email.welcome_sent")
+    except Exception:
+        log.exception("email.welcome_failed")
+
+
 def get_db() -> Session:
     db = SessionLocal()
     try:
@@ -223,9 +324,16 @@ def health() -> Dict[str, str]:
     return {"status": "ok"}
 
 
+@app.post("/auth/signup")
 @app.post("/api/auth/signup")
-def signup(payload: AuthRequest, db: Session = Depends(get_db)) -> Dict[str, Any]:
+async def signup(payload: AuthRequest, db: Session = Depends(get_db)) -> Dict[str, Any]:
+    if payload.confirm_password is not None and payload.password != payload.confirm_password:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Password confirmation does not match password")
+
     email = payload.email.strip().lower()
+    if not is_valid_email(email):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Enter a valid email")
+
     existing = db.query(Profile).filter(Profile.email == email).first()
     if existing:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="User already exists")
@@ -240,15 +348,23 @@ def signup(payload: AuthRequest, db: Session = Depends(get_db)) -> Dict[str, Any
     db.commit()
     db.refresh(profile)
 
+    await send_welcome_email(profile.email, profile.full_name)
+
     token = create_token(profile.id, profile.email)
     return {"token": token, "user": serialize_profile(profile)}
 
 
+@app.post("/auth/login")
 @app.post("/api/auth/login")
 def login(payload: AuthRequest, db: Session = Depends(get_db)) -> Dict[str, Any]:
     email = payload.email.strip().lower()
+    if not is_valid_email(email):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Enter a valid email")
+
     profile = db.query(Profile).filter(Profile.email == email).first()
-    if not profile or profile.password_hash != hash_password(payload.password):
+    if not profile:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Enter a valid email")
+    if profile.password_hash != hash_password(payload.password):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials")
 
     token = create_token(profile.id, profile.email)
@@ -266,20 +382,30 @@ def list_trades(current_user: Profile = Depends(get_current_user), db: Session =
     return [serialize_trade(trade) for trade in trades]
 
 
+@app.post("/api/trades/verify")
+def verify_trade(payload: TradeCreate, current_user: Profile = Depends(get_current_user)) -> Dict[str, Any]:
+    return validate_trade_payload(payload)
+
+
 @app.post("/api/trades")
 def create_trade(payload: TradeCreate, current_user: Profile = Depends(get_current_user), db: Session = Depends(get_db)) -> Dict[str, Any]:
+    validation = validate_trade_payload(payload)
     trade = Trade(
         user_id=current_user.id,
-        symbol=payload.symbol.upper(),
-        side=payload.side.lower(),
-        quantity=payload.quantity,
-        price=payload.price,
+        symbol=validation["symbol"],
+        side=validation["side"],
+        quantity=validation["quantity"],
+        price=validation["price"],
         status="open",
     )
     db.add(trade)
     db.commit()
     db.refresh(trade)
-    return serialize_trade(trade)
+    response = serialize_trade(trade)
+    response["verified"] = validation["verified"]
+    response["message"] = validation["message"]
+    response["estimated_cost"] = validation["estimated_cost"]
+    return response
 
 
 @app.post("/api/trades/{trade_id}/close")
@@ -344,11 +470,7 @@ def list_transactions(current_user: Profile = Depends(get_current_user), db: Ses
 
 @app.post("/api/transactions")
 def create_transaction(payload: TransactionCreate, current_user: Profile = Depends(get_current_user), db: Session = Depends(get_db)) -> Dict[str, Any]:
-    if payload.type not in {"deposit", "withdraw"}:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Transaction type must be deposit or withdraw")
-
-    if payload.type == "withdraw" and current_user.balance < payload.amount:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Insufficient balance")
+    verification = validate_transaction_payload(payload, current_user.balance)
 
     txn = Transaction(user_id=current_user.id, type=payload.type, amount=payload.amount, note=payload.note or "")
     db.add(txn)
@@ -358,7 +480,33 @@ def create_transaction(payload: TransactionCreate, current_user: Profile = Depen
         current_user.balance -= payload.amount
     db.commit()
     db.refresh(txn)
-    return serialize_transaction(txn)
+
+    response = serialize_transaction(txn)
+    response["verified"] = verification["verified"]
+    response["message"] = verification["message"]
+    response["available_balance"] = round(float(current_user.balance), 2)
+    return response
+
+
+@app.get("/api/trading-tools")
+def trading_tools(current_user: Profile = Depends(get_current_user)) -> Dict[str, Any]:
+    return {
+        "tools": [
+            "portfolio_summary",
+            "market_prices",
+            "watchlist_management",
+            "trade_verification",
+            "deposit_verification",
+            "withdrawal_verification",
+        ],
+        "account_balance": round(float(current_user.balance), 2),
+        "market_snapshot": list_markets(),
+        "live_checks": {
+            "trade_verification": True,
+            "deposit_verification": True,
+            "withdrawal_verification": True,
+        },
+    }
 
 
 @app.get("/api/markets")
